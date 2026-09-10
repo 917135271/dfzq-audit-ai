@@ -76,7 +76,7 @@ Java 保存、转发或生成报告段落依据时须同时读取主 evidenceId/
 
 model_timeout_seconds 默认300秒（大于0、最大900），model_attempts 默认2（1到3），均在 supervision.toml 配置。监督调用不再沿用查询的60秒超时；HTTP层只调用一次，由提取层对调用失败或 JSON/schema 失败有限重试。成功重试记录 metadataChecks.code=MODEL_OUTPUT_RETRY 与 attempt；耗尽仍失败，引用不匹配不会被宽松修复。多组提取时每组分别限制次数，调用方网关超时与异步任务机制需要按实际总耗时配置。
 
-默认 `config/supervision.toml` 中 backend="none"，不会触发真实模型。部署时可以用 `SUPERVISION_CONFIG` 指定外部配置文件，设置 backend="gateway"。
+当前 `config/supervision.toml` 已按要求设置 backend="gateway"；密钥仍从环境读取。部署时可用 `SUPERVISION_CONFIG` 指定外部配置文件，或设置 backend="none" 关闭模型。
 gateway 复用现有 LLMClient，使用进程环境 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL；不自动加载 .env、不保存密钥。
 max_evidence_chars 控制单次证据文本分组容量（不含规则和元数据开销，不是 token 上限）。每一组都处理，单段超容量显式报错，不截断。
 
@@ -96,6 +96,6 @@ max_evidence_chars 控制单次证据文本分组容量（不含规则和元数�
 
 `POST /v1/supervision/associate`，沿用内部令牌鉴权。请求 `pairs` 与 similarity 的每对字段相同（pairId/issueText/recordText），每批 1–8 对，每侧文本最长 4000 字符。返回 `decisions`，每对包含 pairId、verdict（MATCH/NO_MATCH/UNCERTAIN）、reason、issueQuote、recordQuote。
 
-引用必须分别为输入文本的非空连续子串，ID 必须唯一且完整覆盖请求。不通过返回 422，模型关闭返回 503，模型调用失败返回 502。每批单次模型调用，不静默重试或放宽证据校验。配置复用 SUPERVISION_CONFIG 的 backend/model_timeout_seconds 和现有网关环境变量；默认 backend=none。
+引用必须分别为输入文本的非空连续子串，ID 必须唯一且完整覆盖请求。不通过返回 422，模型关闭返回 503，模型调用失败返回 502。模型传输/JSON解析失败按 model_attempts 有限重试；证据校验不放宽，结构/覆盖错误不重试。配置复用 SUPERVISION_CONFIG 和现有网关环境变量。缓存和评测入口见 OPTIMIZATION.md。
 
 输入是调用方已限定范围的抽取描述，并非该接口从数据库读取全文。MATCH 仅表示事项对应，不代表整改完成；多候选及跨问题歧义由 Pi 汇总处理。已确认关系返回两侧 evidenceIds，判定理由及摘录保留在 Pi 工具详情中。

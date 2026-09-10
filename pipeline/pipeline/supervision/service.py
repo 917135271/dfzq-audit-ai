@@ -18,6 +18,7 @@ from common.supervision import SupervisionExtractRequest
 from pipeline.config import DEFAULT_CONFIG_DIR, load_config
 from pipeline.index.object_store import ObjectStore
 from pipeline.index.pg_io import PgIO
+from pipeline.supervision.cache import ResultCache
 from pipeline.supervision.extract import JsonExtractor, prepare_extraction
 
 
@@ -35,6 +36,9 @@ class SupervisionConfig(BaseModel):
     max_evidence_chars: int = Field(gt=0)
     model_timeout_seconds: float = Field(default=300, gt=0, le=900)
     model_attempts: int = Field(default=2, ge=1, le=3)
+    cache_entries: int = Field(default=32, ge=0, le=1024)
+    cache_ttl_seconds: int = Field(default=900, ge=0, le=86400)
+    embedding_cache_entries: int = Field(default=4096, ge=0, le=65536)
 
 
 class SupervisionService:
@@ -45,6 +49,7 @@ class SupervisionService:
         self.store = store
         self.config = config
         self.client = client
+        self._cache = ResultCache(config.cache_entries, config.cache_ttl_seconds)
 
     @classmethod
     def from_config(cls):
@@ -102,13 +107,18 @@ class SupervisionService:
         ir, index_payload = self._read_version(request)
         if self.config.backend == "gateway" and self.client is None:
             raise RuntimeError("Configured supervision extractor is unavailable")
-        output = prepare_extraction(
+        cache_key = hashlib.sha256(json.dumps([
+            request.model_dump(mode="json"), ir.model_dump(mode="json"), index_payload,
+            self.config.model_dump(), id(self.client), getattr(self.client, "model", None),
+            Path(__file__).with_name("extraction-prompt.txt").read_text("utf-8"),
+        ], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        output = self._cache.compute(cache_key, lambda: prepare_extraction(
             request,
             ir,
             client=self.client if self.config.backend == "gateway" else None,
             max_evidence_chars=self.config.max_evidence_chars,
             model_attempts=self.config.model_attempts,
-        )
+        ))
         # 长模型调用期间可能发生重新解析/替代；返回前复验，不给旧内容贴新快照。
         current_ir, current_index = self._read_version(request)
         if current_ir != ir or current_index != index_payload:
