@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -6,9 +7,30 @@ from test_supervision_extraction import Extractor, make_ir, request_data
 
 from common.supervision import SupervisionExtractRequest
 from pipeline.index.embedding_client import Embedding
+from pipeline.supervision import prompting
 from pipeline.supervision.cache import ResultCache
 from pipeline.supervision.service import SupervisionConfig, SupervisionNotReady, SupervisionService
 from pipeline.supervision.similarity import CachedEmbeddings, SimilarityRequest, score_pairs
+
+
+def test_status_policy_change_invalidates_cached_extraction(monkeypatch, tmp_path):
+    root = Path(prompting.__file__).parent
+    for name in ("extraction-prompt.txt", "coverage-prompt.txt", "status-policy.txt"):
+        (tmp_path / name).write_text((root / name).read_text("utf-8"), encoding="utf-8")
+    monkeypatch.setattr(prompting, "__file__", str(tmp_path / "prompting.py"))
+    client = Extractor()
+    service = SupervisionService(None, None, SupervisionConfig(
+        backend="gateway", max_evidence_chars=16000,
+    ), client)
+    monkeypatch.setattr(service, "_read_version", lambda request: (make_ir(), [["chunk", "text"]]))
+    request = SupervisionExtractRequest.model_validate(request_data())
+    service.extract(request)
+    service.extract(request)
+    assert len(client.inputs) == 1
+    with (tmp_path / "status-policy.txt").open("a", encoding="utf-8") as stream:
+        stream.write("\nAdditional status constraint")
+    service.extract(request)
+    assert len(client.inputs) == 2
 
 
 def test_different_cache_keys_do_not_block_each_other():

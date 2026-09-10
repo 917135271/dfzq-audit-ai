@@ -20,6 +20,7 @@ from pipeline.index.object_store import ObjectStore
 from pipeline.index.pg_io import PgIO
 from pipeline.supervision.cache import ResultCache
 from pipeline.supervision.extract import JsonExtractor, prepare_extraction
+from pipeline.supervision.prompting import load_prompt
 
 
 class SupervisionNotReady(ValueError):
@@ -39,6 +40,7 @@ class SupervisionConfig(BaseModel):
     cache_entries: int = Field(default=32, ge=0, le=1024)
     cache_ttl_seconds: int = Field(default=900, ge=0, le=86400)
     embedding_cache_entries: int = Field(default=4096, ge=0, le=65536)
+    coverage_review: bool = False
 
 
 class SupervisionService:
@@ -110,7 +112,9 @@ class SupervisionService:
         cache_key = hashlib.sha256(json.dumps([
             request.model_dump(mode="json"), ir.model_dump(mode="json"), index_payload,
             self.config.model_dump(), id(self.client), getattr(self.client, "model", None),
-            Path(__file__).with_name("extraction-prompt.txt").read_text("utf-8"),
+            load_prompt("extraction-prompt.txt"),
+            load_prompt("coverage-prompt.txt"),
+            Path(__file__).with_name("citation-repair-prompt.txt").read_text("utf-8"),
         ], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         output = self._cache.compute(cache_key, lambda: prepare_extraction(
             request,
@@ -118,6 +122,7 @@ class SupervisionService:
             client=self.client if self.config.backend == "gateway" else None,
             max_evidence_chars=self.config.max_evidence_chars,
             model_attempts=self.config.model_attempts,
+            coverage_review=self.config.coverage_review,
         ))
         # 长模型调用期间可能发生重新解析/替代；返回前复验，不给旧内容贴新快照。
         current_ir, current_index = self._read_version(request)

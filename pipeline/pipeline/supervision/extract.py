@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
-from pathlib import Path
 from typing import Protocol
 
 from pydantic import ValidationError
@@ -14,6 +13,10 @@ from common.ir import BlockType, IRDocument, SourceFormat
 from common.supervision import ModelFacts, SupervisionEvidence, SupervisionExtractRequest
 from pipeline.llm_client import LLMError
 from pipeline.meta import l1_rules
+from pipeline.supervision.coverage import group_evidence, review_coverage
+from pipeline.supervision.normalization import normalize_status
+from pipeline.supervision.prompting import load_prompt
+from pipeline.supervision.quote_repair import ensure_citations
 
 
 class JsonExtractor(Protocol):
@@ -131,6 +134,7 @@ def prepare_extraction(
     client: JsonExtractor | None,
     max_evidence_chars: int,
     model_attempts: int = 2,
+    coverage_review: bool = False,
 ) -> dict:
     if not 1 <= model_attempts <= 3:
         raise ValueError("model_attempts must be between 1 and 3")
@@ -160,24 +164,11 @@ def prepare_extraction(
     checks.append({"field": "dateCandidates", "candidates": [str(d) for d in detected.dates]})
     facts: list[dict] = []
     if client is not None:
-        prompt = (Path(__file__).parent / "extraction-prompt.txt").read_text(encoding="utf-8")
-        groups: list[list[SupervisionEvidence]] = []
-        current: list[SupervisionEvidence] = []
-        size = 0
-        for item in evidence:
-            if len(item.text) > max_evidence_chars:
-                raise ValueError(
-                    "Evidence exceeds max_evidence_chars; increase configured capacity"
-                )
-            if current and size + len(item.text) > max_evidence_chars:
-                groups.append(current)
-                current, size = [], 0
-            current.append(item)
-            size += len(item.text)
-        if current:
-            groups.append(current)
+        prompt = load_prompt("extraction-prompt.txt")
+        groups = group_evidence(evidence, max_evidence_chars)
         rules = {r.ruleId: r for r in request.rules}
-        for group in groups:
+        batches = []
+        for group_index, group in enumerate(groups):
             sources = {e.evidenceId: e for e in group}
             body = {
                 "metadata": request.metadata.model_dump(),
@@ -209,36 +200,91 @@ def prepare_extraction(
                     if attempt + 1 == model_attempts:
                         raise
                     checks.append({"code": "MODEL_OUTPUT_RETRY", "attempt": attempt + 2})
+            if coverage_review:
+                for attempt in range(model_attempts):
+                    try:
+                        response, review_check = review_coverage(
+                            body, response, client, retry=attempt > 0,
+                        )
+                        checks.append({**review_check, "groupIndex": group_index})
+                        break
+                    except (LLMError, ValidationError):
+                        if attempt + 1 == model_attempts:
+                            raise
+                        checks.append({"code": "COVERAGE_OUTPUT_RETRY", "attempt": attempt + 2})
+            batches.append((sources, response))
+        if coverage_review:
+            for index in range(1, len(groups)):
+                boundary = [groups[index - 1][-1], groups[index][0]]
+                if sum(len(e.text) for e in boundary) > max_evidence_chars:
+                    checks.append({"code": "BOUNDARY_REVIEW_SKIPPED_CAPACITY", "groupIndex": index})
+                    continue
+                boundary_ids = {e.evidenceId for e in boundary}
+                targets = []
+                for batch_index in (index - 1, index):
+                    for fact_index, fact in enumerate(batches[batch_index][1].facts):
+                        cited = {c.evidenceId for v in fact.values.values() for c in v.citations()}
+                        if cited and cited <= boundary_ids:
+                            targets.append((batch_index, fact_index, fact))
+                if not targets:
+                    checks.append({
+                        "code": "BOUNDARY_REVIEW_NO_COMPLETE_TARGET", "groupIndex": index,
+                    })
+                    continue
+                boundary_body = {**body, "evidence": [e.model_dump() for e in boundary],
+                                 "boundaryOnly": True}
+                reviewed, check = review_coverage(
+                    boundary_body, ModelFacts(facts=[t[2] for t in targets]), client,
+                )
+                # Only supplement known facts; new boundary facts could duplicate group output.
+                if len(reviewed.facts) != len(targets):
+                    raise ValueError("Boundary review cannot add independent facts")
+                for target, updated in zip(targets, reviewed.facts, strict=True):
+                    batch_index, fact_index, _ = target
+                    batches[batch_index][1].facts[fact_index] = updated
+                    batches[batch_index][0].update({e.evidenceId: e for e in boundary})
+                checks.append({**check, "code": "BOUNDARY_REVIEWED", "groupIndex": index})
+        for sources, response in batches:
             for fact in response.facts:
                 if fact.ruleId not in rules:
                     raise ValueError("Unknown extraction rule in model output")
                 if not set(fact.organizationIds) <= set(request.metadata.organizationIds):
                     raise ValueError("Model output organization outside uploaded scope")
                 allowed_fields = {f.key for f in rules[fact.ruleId].extractFields}
+                if (fact.factType == "ACCOUNTABILITY"
+                        and rules[fact.ruleId].reportSection != "internal.accountability"
+                        and allowed_fields <= {
+                            "issueDescription", "rectificationStatus", "evidenceLocation",
+                        }):
+                    checks.append({"code": "ACCOUNTABILITY_OUTSIDE_REQUESTED_FIELDS",
+                                   "ruleId": fact.ruleId})
+                    continue
                 if not set(fact.values) <= allowed_fields:
                     raise ValueError("Unknown extraction field in model output")
-                for field_key, value in fact.values.items():
-                    # 主引用直接校正到字段，补充引用校正到其自身；不改 value 或原文。
-                    for citation in [value, *value.supportingEvidence]:
-                        source = sources.get(citation.evidenceId)
-                        if source is None:
-                            raise ValueError(
-                                "Model output references unknown evidence or non-verbatim quote"
-                            )
-                        if citation.quote not in source.text:
-                            restored = _restore_pdf_line_breaks(source, citation.quote)
-                            if restored is None:
-                                raise ValueError(
-                                    "Model output references unknown evidence or non-verbatim quote"
-                                )
-                            citation.quote = restored
-                            checks.append({
-                                "field": f"facts.{field_key}",
-                                "ruleId": fact.ruleId,
-                                "code": "PDF_QUOTE_LINE_BREAKS_RESTORED",
-                                "evidenceId": citation.evidenceId,
-                            })
+                checks.extend(ensure_citations(
+                    fact, sources, client, model_attempts, _restore_pdf_line_breaks,
+                ))
                 payload = fact.model_dump(exclude_defaults=True)
+                # Keep the wire type explicit even for legacy clients omitting it.
+                # An unknown type must not silently become a new finding.
+                payload["factType"] = fact.factType
+                if (fact.factType == "UNSPECIFIED"
+                        and rules[fact.ruleId].reportSection == "internal.accountability"
+                        and "accountabilityAction" in fact.values):
+                    payload["factType"] = "ACCOUNTABILITY"
+                    checks.append({"code": "FACT_TYPE_FROM_ACCOUNTABILITY_RULE",
+                                   "ruleId": fact.ruleId})
+                if (fact.factType == "UNSPECIFIED"
+                        and rules[fact.ruleId].reportSection == "internal.daily.litigation"):
+                    payload["factType"] = "LITIGATION"
+                    checks.append({"code": "FACT_TYPE_FROM_LITIGATION_RULE", "ruleId": fact.ruleId})
+                if "rectificationStatus" in payload["values"]:
+                    status = payload["values"]["rectificationStatus"]
+                    normalized = normalize_status(status["value"])
+                    if normalized != status["value"]:
+                        checks.append({"code": "STATUS_NORMALIZED", "ruleId": fact.ruleId,
+                                       "originalValue": status["value"], "value": normalized})
+                        status["value"] = normalized
                 if "evidenceLocation" in allowed_fields:
                     # 定位来自已校验的证据元数据，不让模型猜页码或块范围。
                     first_value = next(iter(fact.values.values()))
@@ -267,7 +313,12 @@ def prepare_extraction(
                         payload["values"]["evidenceLocation"]["supportingEvidence"] = list(
                             unique_citations.values()
                         )
-                canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                hash_payload = dict(payload)
+                if hash_payload.get("factType") == "UNSPECIFIED":
+                    # Preserve legacy identities: the old default was omitted from
+                    # hashing. The response can still expose the default explicitly.
+                    hash_payload.pop("factType")
+                canonical = json.dumps(hash_payload, ensure_ascii=False, sort_keys=True)
                 facts.append(
                     {
                         "factId": hashlib.sha256(canonical.encode()).hexdigest(),

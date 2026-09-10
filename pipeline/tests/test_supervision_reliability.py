@@ -55,7 +55,27 @@ def test_untrusted_quotes_are_not_relaxed_by_retries():
     with pytest.raises(ValueError, match='non-verbatim'):
         prepare_extraction(SupervisionExtractRequest.model_validate(request_data()), make_ir(),
                            client=client, max_evidence_chars=1000)
-    assert len(client.inputs) == 1
+    # One reference-only repair is allowed; invalid quotes still fail closed.
+    assert len(client.inputs) == 2
+
+
+@pytest.mark.parametrize('section,expected', [('external.regulatory', 0),
+                                               ('internal.accountability', 1)])
+def test_problem_only_rule_does_not_collect_unrequested_accountability(section, expected):
+    data = request_data()
+    data['rules'][0]['reportSection'] = section
+    data['rules'][0]['extractFields'] = [{'key': 'issueDescription', 'description': '问题'}]
+
+    def adapt(fact):
+        fact['factType'] = 'ACCOUNTABILITY'
+        fact['values'] = {'issueDescription': fact['values']['problem']}
+
+    output = prepare_extraction(SupervisionExtractRequest.model_validate(data), make_ir(),
+                                client=Extractor(adapt), max_evidence_chars=1000)
+    assert len(output['facts']) == expected
+    if not expected:
+        assert any(c.get('code') == 'ACCOUNTABILITY_OUTSIDE_REQUESTED_FIELDS'
+                   for c in output['metadataChecks'])
 
 
 def test_supervision_timeout_configuration_does_not_change_query_defaults(monkeypatch):
